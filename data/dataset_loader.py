@@ -8,6 +8,7 @@ from dgl.dataloading import GraphDataLoader
 from data.anomaly_generator import AnomalyGenerator
 import dgl.function as fn
 from dgl import KHopGraph
+from sklearn.preprocessing import StandardScaler
 
 # ======================================================================
 #   MRQSampler: 瑞利商子图采样器
@@ -362,33 +363,57 @@ class UniGADDataset(torch.utils.data.Dataset):
             'tfinance', 'tolokers', 'questions'
         ]
         
-        # 直接检查 name 是否在简称列表中 ---
+        # # 直接检查 name 是否在简称列表中 ---
+        # if name in SINGLEGRAPH_NAMES:
+        #     # 单图数据集逻辑保持不变
+        #     self.is_single_graph = True
+        #     full_path = os.path.join(data_dir, 'edge_labels', f"{name}-els")
+        #     print(f"Loading single-graph dataset from: {full_path}")
+        #     self.graph_list, _ = dgl.load_graphs(full_path)
+        #     self.graph_labels = torch.tensor([])
+        #     self.labels_have = ''
+        #     if 'node_label' in self.graph_list[0].ndata: self.labels_have += 'n'
+        #     if 'edge_label' in self.graph_list[0].edata: self.labels_have += 'e'
+            
+        # else:
+        #     self.is_single_graph = False
+        #     # 使用映射获取完整子路径
+        #     full_path = os.path.join(data_dir, 'unified', name)
+        #     print(f"Loading multi-graph dataset from: {full_path}")
+        #     self.graph_list, labels_dict = dgl.load_graphs(full_path)
+            
+        #     self.labels_have = 'g' if 'glabel' in labels_dict else ''
+        #     if 'g' in self.labels_have:
+        #         self.graph_labels = labels_dict['glabel']
+        #     else:
+        #         self.graph_labels = torch.tensor([])
+
         if name in SINGLEGRAPH_NAMES:
-            # 单图数据集逻辑保持不变
             self.is_single_graph = True
             full_path = os.path.join(data_dir, 'edge_labels', f"{name}-els")
             print(f"Loading single-graph dataset from: {full_path}")
             self.graph_list, _ = dgl.load_graphs(full_path)
             self.graph_labels = torch.tensor([])
-            self.labels_have = ''
-            if 'node_label' in self.graph_list[0].ndata: self.labels_have += 'n'
-            if 'edge_label' in self.graph_list[0].edata: self.labels_have += 'e'
-            
-        else:
+        else: # Multi-graph
             self.is_single_graph = False
-            # 使用映射获取完整子路径
             full_path = os.path.join(data_dir, 'unified', name)
             print(f"Loading multi-graph dataset from: {full_path}")
             self.graph_list, labels_dict = dgl.load_graphs(full_path)
-            
-            self.labels_have = 'g' if 'glabel' in labels_dict else ''
-            if 'g' in self.labels_have:
-                self.graph_labels = labels_dict['glabel']
-            else:
-                self.graph_labels = torch.tensor([])
+            self.graph_labels = labels_dict.get('glabel', torch.tensor([]))
 
         if not self.graph_list:
             raise FileNotFoundError(f"No graphs loaded from path: {full_path}. Please check the path and data.")
+
+        # =================================================================
+        #   核心修复点：特征归一化逻辑
+        # =================================================================
+        self._normalize_features()
+
+        # 确定标签存在情况
+        self.labels_have = ''
+        if 'node_label' in self.graph_list[0].ndata and self.graph_list[0].ndata['node_label'].numel() > 0: self.labels_have += 'n'
+        if self.is_single_graph and 'edge_label' in self.graph_list[0].edata and self.graph_list[0].edata['edge_label'].numel() > 0: self.labels_have += 'e'
+        if self.graph_labels.numel() > 0: self.labels_have += 'g'
 
         if debug_num > 0:
             self.graph_list = self.graph_list[:debug_num]
@@ -407,6 +432,52 @@ class UniGADDataset(torch.utils.data.Dataset):
             # to_cpu() 确保了即使图在GPU上也能正常工作
             graph_for_community_detection = self.graph_list[0].to('cpu')
             self.anomaly_generator = AnomalyGenerator(graph_for_community_detection)
+
+
+    def _normalize_features(self):
+        """
+        内部辅助函数，检查并标准化图的节点特征。
+        对大规模多图数据集进行了优化。
+        """
+        print("Checking and normalizing features...")
+        # 检查第一个图的特征来决定是否需要标准化
+        if not self.graph_list or 'feature' not in self.graph_list[0].ndata:
+            print("No features found to normalize.")
+            return
+            
+        features = self.graph_list[0].ndata['feature']
+        needs_normalization = features.dtype == torch.long or \
+                              (features.dtype == torch.float and features.abs().max() > 10)
+
+        if not needs_normalization:
+            print("Features are already in a reasonable range. Skipping normalization.")
+            return
+
+        print(f"Normalizing features for dataset '{self.name}'...")
+        if self.is_single_graph:
+            g = self.graph_list[0]
+            features = g.ndata['feature'].float()
+            scaler = StandardScaler()
+            scaled_features = scaler.fit_transform(features.numpy())
+            g.ndata['feature'] = torch.from_numpy(scaled_features).float()
+        else: # Multi-graph
+            # 对于大规模多图，一次性拼接所有特征可能会爆内存。
+            # 我们采用更稳健的在线均值和方差计算方法。
+            scaler = StandardScaler()
+            
+            # 分块处理以避免内存溢出
+            # 先用一部分数据 fit scaler
+            print("Fitting StandardScaler on a subset of features...")
+            subset_features = torch.cat([g.ndata['feature'] for g in self.graph_list[:1000]], dim=0).float()
+            scaler.fit(subset_features.numpy())
+            
+            # 然后逐个图进行 transform
+            print("Transforming features for all graphs...")
+            for g in tqdm(self.graph_list, desc="Normalizing graph features"):
+                if 'feature' in g.ndata and g.num_nodes() > 0:
+                    features = g.ndata['feature'].float()
+                    scaled_features = scaler.transform(features.numpy())
+                    g.ndata['feature'] = torch.from_numpy(scaled_features).float()
 
     def prepare_split(self, trial_id=0, train_ratio=0.4, val_ratio=0.2, seed=42):
         """为指定的实验次数(trial_id)准备数据划分"""
@@ -624,7 +695,21 @@ def collate_fn_unify(samples,
     if isinstance(samples[0][0], dgl.DGLGraph) and isinstance(samples[0][1], dict):
         # 多图数据集: samples is a list of (graph, labels_dict)
         graphs, labels_list = map(list, zip(*samples))
-        batched_graph = dgl.batch(graphs)
+        # batched_graph = dgl.batch(graphs)
+
+        cleaned_graphs = []
+        for g in graphs:
+            # 1. 创建一个只包含结构的新图
+            cleaned_g = dgl.graph(g.edges(), num_nodes=g.num_nodes())
+            # 2. 只迁移我们需要的 'feature' 和 'node_label'
+            if 'feature' in g.ndata:
+                cleaned_g.ndata['feature'] = g.ndata['feature']
+            if 'node_label' in g.ndata:
+                cleaned_g.ndata['node_label'] = g.ndata['node_label']
+            cleaned_graphs.append(cleaned_g)
+
+        # 使用清洗后的图列表进行批处理
+        batched_graph = dgl.batch(cleaned_graphs)
         
         # 准备模型输入
         # 预计算的嵌入将在训练器中完成，这里只准备图和节点标签

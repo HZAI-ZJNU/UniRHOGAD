@@ -73,7 +73,10 @@ class GCN(nn.Module):
         self.head = nn.Identity()   # 输出头（初始化为恒等映射）
 
     def forward(self, g, inputs, return_hidden=False):
-        h = inputs
+        if inputs.dtype == torch.long:
+            h = inputs.float()
+        else:
+            h = inputs
         hidden_list = []
         for l in range(self.num_layers):
             h = F.dropout(h, p=self.dropout, training=self.training)    # dropout

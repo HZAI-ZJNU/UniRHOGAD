@@ -225,6 +225,8 @@ class GraphMAE_PAA(nn.Module):
         """用于在下游任务中获取节点嵌入的接口"""
         # 在推理时，我们使用原始的、完整的图
         with torch.no_grad():
+            if x.dtype == torch.long:
+                x = x.float()
             return self.encoder(g, x)
 
     # ======================================================================
@@ -239,6 +241,9 @@ class GraphMAE_PAA(nn.Module):
         mask_nodes = perm[:num_mask_nodes]
         
         out_x = x.clone()
+
+        # 动态转换 [MASK] 令牌的数据类型以匹配输入 x
+        mask_token = self.enc_mask_token.to(x.device, dtype=x.dtype)
         
         if self._replace_ratio > 0 and num_mask_nodes > 0:
             # b. 计算两种掩码策略各自的节点数
@@ -261,13 +266,13 @@ class GraphMAE_PAA(nn.Module):
             if token_nodes.numel() > 0:
                 # 我们显式地将 self.enc_mask_token 扩展到目标形状
                 # .expand() 是一个高效的操作，它不会实际复制内存
-                expanded_mask_token = self.enc_mask_token.expand(token_nodes.size(0), -1)
+                expanded_mask_token = mask_token.expand(token_nodes.size(0), -1)
                 # 替换掩码节点的特征为 [MASK] 令牌
                 out_x[token_nodes] = expanded_mask_token
             
         elif num_mask_nodes > 0: # 如果不使用混合策略
             # 即使在非混合模式下，也使用显式扩展，保持代码健壮性
-            expanded_mask_token = self.enc_mask_token.expand(num_mask_nodes, -1)
+            expanded_mask_token = mask_token.expand(num_mask_nodes, -1)
             out_x[mask_nodes] = expanded_mask_token
             
         return out_x, mask_nodes
@@ -287,23 +292,27 @@ class GraphMAE_PAA(nn.Module):
         """
         场景自适应的前向传播。
         """
+
+        # 确保输入特征 x 是浮点数类型，GNN层才能处理
+        if x.dtype == torch.long:
+            x_float = x.float()
+        else:
+            x_float = x
+
         # 默认执行重建损失
-        loss_recon = self._forward_recon_only(g, x)
+        loss_recon = self._forward_recon_only(g, x_float)
         
         # 如果对比损失被启用，则计算并加权
+        loss_cont = torch.tensor(0.0, device=x.device)
         if self.w_contrastive > 0:
-            loss_cont = 0.0
             # --- 场景一：单图 PAA ---
-            if self.anomaly_generator is not None:
-                loss_cont = self._get_paa_contrastive_loss(g, x)
+            if self.anomaly_generator is not None and g.batch_size == 1:
+                loss_cont = self._get_paa_contrastive_loss(g, x_float)
             # --- 场景二：多图 GraphCL ---
             elif g.batch_size > 1:
                 loss_cont = self._get_graphcl_contrastive_loss(g)
             
-            return self.w_contrastive * loss_cont + self.w_recon * loss_recon
-        
-        # 如果对比损失未启用，只返回重建损失
-        return loss_recon
+        return self.w_contrastive * loss_cont + self.w_recon * loss_recon
 
     def _forward_recon_only(self, g, x):
         """标准的 GraphMAE 重建损失"""
@@ -312,6 +321,11 @@ class GraphMAE_PAA(nn.Module):
         
         if mask_nodes.numel() == 0: return torch.tensor(0.0, device=x.device)
 
+        if x1.dtype == torch.long:
+            x1_float = x1.float()
+        else:
+            x1_float = x1
+
         rep1 = self.encoder(g1, x1)
         rep1_decoded = self.encoder_to_decoder(rep1)
         
@@ -319,24 +333,30 @@ class GraphMAE_PAA(nn.Module):
             rep1_decoded[mask_nodes] = 0
         
         recon = self.decoder(g1, rep1_decoded) if not isinstance(self.decoder, nn.Sequential) else self.decoder(rep1_decoded)
+
+        # 重建的目标是原始特征 x，其类型可能与 recon 不同
+        # 在计算损失前，确保目标类型与预测类型匹配
+        target_x = x[mask_nodes]
+        if recon.dtype != target_x.dtype:
+            target_x = target_x.to(recon.dtype)
         
-        return self.criterion(recon[mask_nodes], x[mask_nodes])
+        return self.criterion(recon[mask_nodes], target_x)
 
     def _get_paa_contrastive_loss(self, g, x):
         """单图场景下的 PAA (节点级对比 + 重建)"""
         # 1. 视图一：标准掩码
         g1 = drop_edge(g, self._drop_edge_rate)
-        x1, mask_nodes = self.encoding_mask_noise(g, x)
+        x1, _ = self.encoding_mask_noise(g, x)
         
         # 2. 视图二：人工异常
         num_to_aug = int(g.num_nodes() * self._mask_ratio)
+        if num_to_aug == 0: return torch.tensor(0.0, device=x.device)
         nodes_to_aug = torch.randperm(g.num_nodes(), device=g.device)[:num_to_aug]
-        
-        if nodes_to_aug.numel() == 0: return self._forward_recon_only(g, x)
         
         aug_node_ids, perturbed_feats, perturbed_graph = self.anomaly_generator.generate_for_nodes(nodes_to_aug)
         
-        if aug_node_ids is None or aug_node_ids.numel() == 0: return self._forward_recon_only(g, x)
+        if aug_node_ids is None or aug_node_ids.numel() == 0: 
+            return torch.tensor(0.0, device=x.device)
 
         device = x.device
         aug_node_ids = aug_node_ids.to(device)
@@ -364,18 +384,38 @@ class GraphMAE_PAA(nn.Module):
         g1_list, g2_list = [], []
         # 获取原始特征，因为增强函数需要它
         original_features = g_batched.ndata['feature']
+
+        # 确保原始特征也是浮点数
+        if original_features.dtype == torch.long:
+            original_features = original_features.float()
         
         # 我们需要知道每个小图的节点数，以便正确地切分特征
         nodes_per_graph = g_batched.batch_num_nodes().tolist()
         node_offsets = [0] + np.cumsum(nodes_per_graph).tolist()
 
+        # for i, g in enumerate(graphs):
+        #     # 为每张图切分出它自己的原始特征
+        #     start, end = node_offsets[i], node_offsets[i+1]
+        #     g_features = original_features[start:end]
+            
+        #     g1_list.append(augment_graph_view(g, g_features, 0.2, 0.2, 0.2))
+        #     g2_list.append(augment_graph_view(g, g_features, 0.2, 0.2, 0.2))
+
         for i, g in enumerate(graphs):
-            # 为每张图切分出它自己的原始特征
+            # =================================================================
+            #   核心修复点：清洗和归一化每个图的 ndata
+            # =================================================================
+            # 1. 创建一个新的、干净的图，只包含结构
+            cleaned_g = dgl.graph(g.edges(), num_nodes=g.num_nodes())
+            
+            # 2. 为新图只赋予我们需要的 'feature' 属性
             start, end = node_offsets[i], node_offsets[i+1]
             g_features = original_features[start:end]
+            cleaned_g.ndata['feature'] = g_features
             
-            g1_list.append(augment_graph_view(g, g_features, 0.2, 0.2, 0.2))
-            g2_list.append(augment_graph_view(g, g_features, 0.2, 0.2, 0.2))
+            # 3. 后续所有操作都基于这个干净的图 cleaned_g
+            g1_list.append(augment_graph_view(cleaned_g, g_features, 0.2, 0.2, 0.2))
+            g2_list.append(augment_graph_view(cleaned_g, g_features, 0.2, 0.2, 0.2))
 
         # 2. 重新批处理
         g1_batched = dgl.batch(g1_list)

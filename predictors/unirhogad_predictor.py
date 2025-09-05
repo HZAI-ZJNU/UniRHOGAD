@@ -79,31 +79,29 @@ class Uni_RHO_GAD_Predictor(nn.Module):
         })
 
     def forward(self, 
-                batched_inputs: Dict[str, DGLGraph], 
-                original_graph: Optional[DGLGraph] = None,
-                batched_target_ids: Optional[Dict[str, torch.Tensor]] = None,
-                normal_masks: Optional[Dict[str, torch.Tensor]] = None):
+            batched_inputs: Dict[str, DGLGraph], 
+            original_graph: Optional[DGLGraph] = None,
+            normal_masks: Optional[Dict[str, torch.Tensor]] = None):
 
         # --- Step 1: 高效的初始嵌入提取 ---
         initial_embeddings = {}
         device = next(self.parameters()).device # 获取模型所在的设备
 
-        if self.is_single_graph:
-            if original_graph is None:
-                raise ValueError("`original_graph` must be provided for single-graph scenarios.")
-            
-            original_graph = original_graph.to(device)
-            with torch.no_grad():
-                global_h = self.pretrain_model.to(device).embed(original_graph, original_graph.ndata['feature'])
-            
-            for task, g_batch in batched_inputs.items():
-                if g_batch.num_nodes() > 0:
-                    original_node_ids = g_batch.ndata[dgl.NID].to(device)
-                    initial_embeddings[task] = global_h[original_node_ids]
-        else:
-            with torch.no_grad():
+        with torch.no_grad():
+            if self.is_single_graph:
+                if original_graph is None:
+                    raise ValueError("`original_graph` must be provided for single-graph scenarios.")
+                
+                original_graph = original_graph.to(device)
+                global_h = self.pretrain_model.embed(original_graph, original_graph.ndata['feature'])
+                
                 for task, g_batch in batched_inputs.items():
-                     if g_batch.num_nodes() > 0:
+                    if g_batch.num_nodes() > 0:
+                        original_node_ids = g_batch.ndata[dgl.NID].to(device)
+                        initial_embeddings[task] = global_h[original_node_ids]
+            else:
+                for task, g_batch in batched_inputs.items():
+                    if g_batch.num_nodes() > 0:
                         g_batch = g_batch.to(device)
                         initial_embeddings[task] = self.pretrain_model.to(device).embed(g_batch, g_batch.ndata['feature'])
         
@@ -121,22 +119,8 @@ class Uni_RHO_GAD_Predictor(nn.Module):
             g_batch = batched_inputs[task]
             h_robust_nodes, loss_gna = self.rho_encoders[task](g_batch, h_adapted)
             
-            # Readout: 根据任务类型提取最终表示
-            task_level_rep = None
-
             # 先将要池化的特征存入图中
             g_batch.ndata['h_for_readout'] = h_robust_nodes
-
-            # if task == 'n':
-            #     # 无论是单图还是多图，节点任务在融合前都应被池化为图级别表示
-            #     # 因为 g_batch 对于多图节点任务也是一个批处理图
-            #     task_level_rep = dgl.mean_nodes(g_batch, 'h_for_readout')
-            # elif task == 'g':
-            #     # 图任务：对每个图进行池化
-            #     task_level_rep = dgl.mean_nodes(g_batch, 'h_for_readout')
-            # elif task == 'e':
-            #     # 边任务: 对端点子图池化
-            #     task_level_rep = dgl.mean_nodes(g_batch, 'h_for_readout')
 
             # 统一的池化逻辑
             task_level_rep = dgl.mean_nodes(g_batch, 'h_for_readout')
@@ -147,27 +131,22 @@ class Uni_RHO_GAD_Predictor(nn.Module):
             if task_level_rep is not None:
                 branch_representations[task] = task_level_rep
             
-             # --- Step 3: 累加损失 (仅在训练时) ---
+            # --- Step 3: 累加损失 (仅在训练时) ---
             if self.training:
                 if loss_gna is not None: 
                     total_gna_loss += loss_gna
 
                 # 计算 one-class 损失
-                if normal_masks and task in normal_masks and normal_masks[task].sum() > 0:
-                    # 无论是哪个任务，task_level_rep 都是图级别的。
-                    # 因此，我们需要一个图级别的掩码来索引它。
-                    # 对于节点任务('n')，我们使用图任务('g')的掩码，因为它们共享相同的图批次。
-                    mask_key = 'g' if task == 'n' and not self.is_single_graph else task
-                    
-                    if mask_key in normal_masks and normal_masks[mask_key].sum() > 0:
-                        current_mask = normal_masks[mask_key]
-                        # 确保掩码和张量的长度匹配
-                        if current_mask.shape[0] == task_level_rep.shape[0]:
-                            normal_reps = task_level_rep[current_mask]
-                            center = self.centers[task]
-                            one_class_loss = torch.pow(normal_reps - center, 2).mean()
-                            total_one_class_loss += one_class_loss
-        
+                mask_key = 'g' if task == 'n' and not self.is_single_graph else task
+                
+                if normal_masks and mask_key in normal_masks and normal_masks[mask_key].sum() > 0:
+                    current_mask = normal_masks[mask_key]
+                    # 确保掩码和张量的长度匹配
+                    if current_mask.shape[0] == task_level_rep.shape[0]:
+                        normal_reps = task_level_rep[current_mask]
+                        center = self.centers[task]
+                        one_class_loss = torch.pow(normal_reps - center, 2).mean()
+                        total_one_class_loss += one_class_loss
 
         # --- Step 4: 通过并行的融合头进行预测 ---
         # 对于多图场景，节点和图任务都源自同一个批处理图
