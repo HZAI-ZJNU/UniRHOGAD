@@ -362,31 +362,6 @@ class UniGADDataset(torch.utils.data.Dataset):
             'reddit', 'weibo', 'amazon', 'yelp', 
             'tfinance', 'tolokers', 'questions'
         ]
-        
-        # # 直接检查 name 是否在简称列表中 ---
-        # if name in SINGLEGRAPH_NAMES:
-        #     # 单图数据集逻辑保持不变
-        #     self.is_single_graph = True
-        #     full_path = os.path.join(data_dir, 'edge_labels', f"{name}-els")
-        #     print(f"Loading single-graph dataset from: {full_path}")
-        #     self.graph_list, _ = dgl.load_graphs(full_path)
-        #     self.graph_labels = torch.tensor([])
-        #     self.labels_have = ''
-        #     if 'node_label' in self.graph_list[0].ndata: self.labels_have += 'n'
-        #     if 'edge_label' in self.graph_list[0].edata: self.labels_have += 'e'
-            
-        # else:
-        #     self.is_single_graph = False
-        #     # 使用映射获取完整子路径
-        #     full_path = os.path.join(data_dir, 'unified', name)
-        #     print(f"Loading multi-graph dataset from: {full_path}")
-        #     self.graph_list, labels_dict = dgl.load_graphs(full_path)
-            
-        #     self.labels_have = 'g' if 'glabel' in labels_dict else ''
-        #     if 'g' in self.labels_have:
-        #         self.graph_labels = labels_dict['glabel']
-        #     else:
-        #         self.graph_labels = torch.tensor([])
 
         if name in SINGLEGRAPH_NAMES:
             self.is_single_graph = True
@@ -404,9 +379,6 @@ class UniGADDataset(torch.utils.data.Dataset):
         if not self.graph_list:
             raise FileNotFoundError(f"No graphs loaded from path: {full_path}. Please check the path and data.")
 
-        # =================================================================
-        #   核心修复点：特征归一化逻辑
-        # =================================================================
         self._normalize_features()
 
         # 确定标签存在情况

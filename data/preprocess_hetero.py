@@ -86,9 +86,6 @@ def preprocess_and_save(args):
     print("--- Building final DGL graph ---")
     final_adj = final_adj.tocoo()
     
-    # =================================================================
-    #   核心修复点：使用 Pandas 手动处理平行边
-    # =================================================================
     
     # 步骤 a: 创建一个包含所有潜在边和权重的 DataFrame
     df = pd.DataFrame({
@@ -118,7 +115,6 @@ def preprocess_and_save(args):
     # 步骤 f: 移除可能存在的自环
     g_final = dgl.remove_self_loop(g_final)
     
-    # =================================================================
     
     g_final.ndata['feature'] = node_features
     g_final.ndata['node_label'] = node_labels
@@ -152,9 +148,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser("Heterogeneous Graph Preprocessing for Yelp and Amazon")
     parser.add_argument('--dataset', type=str, required=True, choices=['amazon', 'yelp'],
                         help="Name of the dataset to preprocess.")
-    parser.add_argument('--data_dir', type=str, default='/home/zjnu/voice_LLM/ljc/graph/unirhogad_project/data/hetero',
+    parser.add_argument('--data_dir', type=str, default='./data/hetero',
                         help="Directory where raw .mat files are stored.")
-    parser.add_argument('--output_dir', type=str, default='/home/zjnu/voice_LLM/ljc/graph/unirhogad_project/data/hetero',
+    parser.add_argument('--output_dir', type=str, default='./data/hetero',
                         help="Root directory to save the processed homogeneous graph.")
     
     parser.add_argument('--pruning_threshold', type=float, default=0.1,

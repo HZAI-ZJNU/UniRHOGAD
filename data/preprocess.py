@@ -91,7 +91,6 @@ def preprocess_data(args):
             nodes_for_edge = torch.unique(torch.cat([u.unsqueeze(0), v.unsqueeze(0)]))
             # 注意：khop_nodes 可能会返回大量的节点，导致子图很大
             # 一个更可控的方法是只包含端点
-            # nodes_in_subgraph = dgl.khop_nodes(original_graph, nodes_for_edge, k=1)
             subgraph = dgl.node_subgraph(original_graph, nodes_for_edge, store_ids=True)
             subgraph.ndata['feature'] = original_features[subgraph.ndata[dgl.NID]]
             precomputed_data['edge_subgraphs'][edge_id] = subgraph

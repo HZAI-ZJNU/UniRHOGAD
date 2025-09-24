@@ -5,7 +5,7 @@ import pprint
 import itertools
 from functools import reduce
 import dgl.function as fn
-from models.rho_encoder import RHOEncoder
+from models.rho_encoder import RHOEncoder, RHOEncoder_NoGNA
 from gnn_zoo.homogeneous_gnns import GCN
 from utils.nn_modules import MLP, GraphStitchHead
 from typing import Dict, List, Optional
@@ -228,3 +228,42 @@ class Uni_RHO_GAD_Predictor(nn.Module):
                     anomaly_scores[task] = distances
                     
         return anomaly_scores
+
+class Uni_RHO_GAD_Predictor_NoGNA(Uni_RHO_GAD_Predictor):
+    """
+    Uni_RHO_GAD_Predictor的消融实验版本，专门用于消融GNA模块。
+    它继承自原始预测器，但使用 RHOEncoder_NoGNA 替换了 RHOEncoder。
+    """
+    def __init__(self, *args, **kwargs):
+        # 调用父类的构造函数来初始化所有其他组件
+        # (pretrain_model, feature_adapter, fusion_heads, centers, etc.)
+        super().__init__(*args, **kwargs)
+        
+        # --- 核心修改：用消融版本替换 RHO 编码器 ---
+        # 从父类构造函数接收的原始参数中提取所需信息
+        embed_dims = kwargs.get('embed_dims')
+        base_gnn_layers = kwargs.get('base_gnn_layers')
+        dropout_rate = kwargs.get('dropout_rate')
+        activation = kwargs.get('activation')
+        residual = kwargs.get('residual')
+        norm = kwargs.get('norm')
+        gna_projection_dim = kwargs.get('gna_projection_dim')
+        all_tasks = kwargs.get('all_tasks')
+
+        # 重新构建 rho_encoders ModuleDict，但这次使用 RHOEncoder_NoGNA
+        self.rho_encoders = nn.ModuleDict()
+        for task in all_tasks:
+            # 基础GNN的构建逻辑与父类完全相同
+            base_gnn = GCN(
+                in_dim=embed_dims, num_hidden=embed_dims, out_dim=embed_dims,
+                num_layers=base_gnn_layers, dropout=dropout_rate,
+                activation=activation,
+                residual=residual,
+                norm=norm,
+                encoding=True
+            )
+            # 使用我们新的、没有GNA的Encoder
+            self.rho_encoders[task] = RHOEncoder_NoGNA(base_gnn, embed_dims, gna_projection_dim)
+        
+        print("--- Initialized Uni_RHO_GAD_Predictor_NoGNA ---")
+        print("--- All RHOEncoders have been replaced with the NoGNA version. ---")

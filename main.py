@@ -10,7 +10,8 @@ import time
 from functools import partial
 from data.dataset_loader import UniGADDataset, collate_fn_unify
 from models.pretrain_model import GraphMAE_PAA
-from predictors.unirhogad_predictor import Uni_RHO_GAD_Predictor
+from models.ablation_models import Uni_RHO_GAD_Predictor_BaseGNN
+from predictors.unirhogad_predictor import Uni_RHO_GAD_Predictor, Uni_RHO_GAD_Predictor_NoGNA
 from e2e_trainer import Trainer
 from utils.misc import set_seed
 from torch.utils.data import WeightedRandomSampler
@@ -22,6 +23,14 @@ def get_args():
     # (可选) 允许命令行覆盖个别关键参数
     parser.add_argument('--device', type=str, default=None, help="Override the device setting in the config file.")
     parser.add_argument('--epochs', type=int, default=None, help="Override the epochs setting in the config file.")
+
+    # 消融实验相关参数
+    parser.add_argument('--ablation', type=str, default=None, 
+                    choices=['no_gna'], help="Specify which ablation study to run.")
+
+    parser.add_argument('--baseline', type=str, default=None, 
+                    choices=['gcn', 'gin'], # 您可以根据您实现的 GNN 扩展这个列表
+                    help="Run a classic GNN baseline instead of the full model.")
     return parser.parse_args()
 
 
@@ -118,22 +127,51 @@ def main(args):
     # 传入 cross_modes 列表
     cross_modes_list = args.cross_modes.split(',')
     all_tasks_list = list(args.all_tasks)
-    model = Uni_RHO_GAD_Predictor(
-        pretrain_model=pretrain_model,
-        feature_adapter=feature_adapter,
-        is_single_graph=dataset.is_single_graph,
-        embed_dims=args.hid_dim,
-        num_classes=2, # 异常/正常
-        all_tasks=all_tasks_list,
-        cross_modes=cross_modes_list,
-        base_gnn_layers=args.base_gnn_layers,
-        final_mlp_layers=args.final_mlp_layers,
-        gna_projection_dim=args.gna_proj_dim,
-        dropout_rate=args.dropout,
-        activation=args.activation,
-        residual=args.residual,
-        norm=args.norm
-    )
+    # model = Uni_RHO_GAD_Predictor(
+    #     pretrain_model=pretrain_model,
+    #     feature_adapter=feature_adapter,
+    #     is_single_graph=dataset.is_single_graph,
+    #     embed_dims=args.hid_dim,
+    #     num_classes=2, # 异常/正常
+    #     all_tasks=all_tasks_list,
+    #     cross_modes=cross_modes_list,
+    #     base_gnn_layers=args.base_gnn_layers,
+    #     final_mlp_layers=args.final_mlp_layers,
+    #     gna_projection_dim=args.gna_proj_dim,
+    #     dropout_rate=args.dropout,
+    #     activation=args.activation,
+    #     residual=args.residual,
+    #     norm=args.norm
+    # )
+
+    model_args = {
+        "pretrain_model": pretrain_model,
+        "feature_adapter": feature_adapter,
+        "is_single_graph": dataset.is_single_graph,
+        "embed_dims": args.hid_dim,
+        "num_classes": 2,
+        "all_tasks": all_tasks_list,
+        "cross_modes": cross_modes_list,
+        "base_gnn_layers": args.base_gnn_layers,
+        "final_mlp_layers": args.final_mlp_layers,
+        "gna_projection_dim": args.gna_proj_dim,
+        "dropout_rate": args.dropout,
+        "activation": args.activation,
+        "residual": args.residual,
+        "norm": args.norm
+    }
+    # --- 核心修改：添加基线模型选择逻辑 ---
+    if cmd_args.baseline:
+        print(f"--- Running Baseline Experiment: {cmd_args.baseline.upper()} ---")
+        # 将基线类型作为参数传入
+        model = Uni_RHO_GAD_Predictor_BaseGNN(base_gnn_type=cmd_args.baseline, **model_args)
+    elif cmd_args.ablation == 'no_gna':
+        print("--- Running Ablation Study: No GNA ---")
+        model = Uni_RHO_GAD_Predictor_NoGNA(**model_args)
+    else:
+        print("--- Running Full Model: Uni_RHO_GAD_Predictor ---")
+        model = Uni_RHO_GAD_Predictor(**model_args)
+    # --- 修改结束 ---
 
     # 3. ==================== 训练启动 ====================
     print("--- Initializing Trainer ---")
@@ -153,37 +191,47 @@ def main(args):
     if final_test_metrics:
         all_results = []
 
-        params_to_save = [
-            # 实验标识
+        # 这些是所有实验都会保存的通用参数
+        common_params = [
             'dataset', 'seed', 'pretrain_model', 'cross_mode',
-            # 模型架构
             'hid_dim', 'base_gnn_layers', 'final_mlp_layers',
-            # 优化器与训练
             'lr', 'l2', 'batch_size', 'epochs', 'patience',
-            # 损失权重
             'w_one_class', 'w_gna', 'w_classification',
-            # 数据增强控制
-            'use_anomaly_generation', 'use_node_aug', 'use_edge_aug',
-            'use_downstream_multi_graph_aug', 'aug_ratio',
-            'aug_num_perturb_edges', 'aug_feature_mix_ratio',
-            # 性能
             'time_cost'
         ]
+        
+        # 这些是只在单图实验中保存的参数
+        single_graph_params = [
+            'use_anomaly_generation', 'use_node_aug', 'use_edge_aug',
+            'aug_ratio', 'aug_num_perturb_edges', 'aug_feature_mix_ratio',
+            'w_classification_n', 'w_classification_e' # 添加任务专属权重
+        ]
+        
+        # 这些是只在多图实验中保存的参数
+        multi_graph_params = [
+            'use_downstream_multi_graph_aug',
+            'aug_drop_node_rate', 'aug_perturb_edge_rate', 'aug_mask_feature_rate'
+        ]
+
+        # --- 步骤 2: 根据当前场景确定要保存的完整参数列表 ---
+        if dataset.is_single_graph:
+            params_to_save = common_params + single_graph_params
+        else:
+            params_to_save = common_params + multi_graph_params
 
         for mode, metrics_dict in final_test_metrics.items():
-            # --- 步骤1: 初始化基础信息和所有要保存的参数 ---
             result_row = {}
+            
+            # --- 步骤 3: 使用 getattr 安全地填充所有参数 ---
             for param in params_to_save:
-                # 使用 getattr 从 args 对象中获取值，如果不存在则返回 None
                 result_row[param] = getattr(args, param, None)
             
-            # --- 步骤2: 更新特定于当前循环的信息 ---
+            # --- 步骤 4: 更新特定于当前循环的信息 (与之前相同) ---
             result_row['pretrain_model'] = os.path.basename(args.pretrain_path)
-            result_row['cross_mode'] = mode
-            # 计算每个 mode 的平均时间成本
+            result_row['cross_mode'] = mode.replace('_to_', '2') # 保持输出格式一致
             result_row['time_cost'] = total_time_cost / len(final_test_metrics) if final_test_metrics else total_time_cost
 
-            # --- 步骤3: 添加所有性能指标 ---
+            # --- 步骤 5: 添加所有性能指标 (与之前相同) ---
             for task, metrics in metrics_dict.items():
                 for metric_name, value in metrics.items():
                     result_row[f'{task}_{metric_name}'] = value

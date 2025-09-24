@@ -1,42 +1,26 @@
-# 注意: PyTorch, TorchVision, TorchAudio 和 DGL 的安装强烈建议遵循官方指令，
-# 以确保与你的 CUDA 版本正确匹配。以下版本号仅供参考。
-# 例如，对于 CUDA 11.8:
-# pip install torch==2.5.0 torchvision==0.20.0 torchaudio==2.5.0 --index-url https://download.pytorch.org/whl/cu118
-# pip install dgl==2.1.0+cu118 -f https://data.dgl.ai/wheels/cu118/repo.html
+# Core Machine Learning & Deep Learning Libraries
 torch==2.5.0
 torchvision==0.20.0
 torchaudio==2.5.0
-dgl==2.1.0+cu118
+# dgl==2.1.0+cu118
 
-# ======================================================================
-#   Data Science & Machine Learning Stack
-# ======================================================================
+# Graph & Data Processing
+networkx==3.3
 numpy==1.26.4
 pandas==2.2.2
-scipy==1.14.0
 scikit-learn==1.5.1
-xgboost==3.0.2
-catboost==1.2.8
-pyod==2.0.5  # Python Outlier Detection library
+scipy==1.14.0
 
-# ======================================================================
-#   Graph Processing & Community Detection
-# ======================================================================
-networkx==3.3
-python-louvain==0.16  # For Louvain community detection
-bidict==0.23.1
+# Community Detection
+python-louvain==0.16
 
-# ======================================================================
-#   Utilities & Helpers
-# ======================================================================
-tqdm==4.66.4  # Progress bars
-PyYAML==6.0.1 # For handling config files
-scikit-image==0.25.2 # May be a dependency of other libraries
-matplotlib==3.9.1 # For plotting (if needed)
-plotly==5.23.0 # For interactive plotting (if needed)
-openpyxl==3.1.5 # For reading/writing Excel files (e.g., saving results)
+# Utilities
+PyYAML==6.0.1
+tqdm==4.66.4
+scikit-image==0.25.2 # For MNIST superpixel generation
+sympy==1.13.1 # For BWGNN polynomial coefficient calculation
 
-# ======================================================================
-#   Optional: For Development & Debugging
-# ======================================================================
-# line_profiler==4.1.3 # If you need to profile code performance
+# (Optional) Add if you use these specific models as baselines
+# catboost==1.2.8
+# xgboost==3.0.2
+# pyod==2.0.5

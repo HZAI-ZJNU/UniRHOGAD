@@ -118,9 +118,7 @@ class AnomalyGenerator:
         
         # b. 创建一个包含原始边和新扰动边的图
         perturbed_graph = self.graph.clone()
-        # perturbed_graph.add_edges(torch.tensor(new_src_nodes, device=device), torch.tensor(new_dst_nodes, device=device))
-        
-        # return torch.stack(valid_perturbed_node_ids), perturbed_features, perturbed_graph
+
         if new_src_nodes: # 确保列表不为空
             # 1. 获取目标图期望的ID类型
             target_dtype = perturbed_graph.idtype

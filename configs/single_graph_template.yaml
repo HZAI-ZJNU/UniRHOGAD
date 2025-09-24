@@ -3,7 +3,7 @@
 # ======================================================================
 
 # e.g. 'reddit', 'amazon', 'yelp', 'weibo', 'questions', 'tolokers', 'tfinance'
-dataset: 'tfinance'
+dataset: 'yelp'
 
 # --- 路径与设备 ---
 data_dir: ./data
@@ -14,11 +14,10 @@ device: cuda
 # --- 训练控制 ---
 seed: 42
 num_trials: 5
-epochs: 100
+epochs: 10
 patience: 30
 batch_size: 64
 metric: AUPRC
-num_workers: 4
 
 # --- 模型与优化器 ---
 lr: 5e-4
@@ -33,7 +32,7 @@ final_mlp_layers: 2
 gna_proj_dim: 128
 
 # --- 预训练模型架构 ---
-pretrain_path: './pretrained/tfinance_enc_gcn2_dec_gcn1_e100_h128_loss_sce.pt'
+pretrain_path: './pretrained/yelp_enc_gcn2_dec_gcn1_e100_h128_loss_sce.pt'
 pretrain_encoder_type: 'gcn'
 pretrain_decoder_type: 'gcn'
 pretrain_hid_dim: 128
@@ -63,11 +62,14 @@ w_classification: 1.0
 w_classification_n: 2.0 # 提高节点任务的权重
 w_classification_e: 0.5 # 降低边任务的权重
 
+# 新增一个参数来控制是否冻结 RHOEncoder
+freeze_rho_encoder: False
+
 # --- 数据增强控制 ---
-use_anomaly_generation: True
-use_node_aug: True  # 在异质图转同质图的amazon和yelp任务中我们不启用节点增强
-use_edge_aug: True
-use_downstream_multi_graph_aug: False
+use_anomaly_generation: False
+use_node_aug: False  # 在异质图转同质图的amazon和yelp任务以及weibo中我们不启用节点增强
+use_edge_aug: False
+# use_downstream_multi_graph_aug: False
 aug_ratio: 0.5
 aug_num_perturb_edges: 5
 aug_feature_mix_ratio: 0.5

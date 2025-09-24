@@ -2,8 +2,8 @@
 #   Base Configuration for Multi-Graph Datasets
 # ======================================================================
 
-# e.g. bm/dgl/bm_mn_dgl, bm/dgl/bm_ms_dgl, bm/dgl/bm_mn_mt_dgl, mnist_processed/mnist0_strict, mnist_processed/mnist1_strict
-dataset: 'mnist_processed/mnist0_strict'
+# e.g. bm/dgl/bm_mn_dgl, bm/dgl/bm_ms_dgl, bm/dgl/bm_mn_mt_dgl, mnist_processed/mnist0_strict, mnist_processed/mnist1_strict, TGroup
+dataset: 'bm/dgl/bm_mn_dgl'
 
 # --- 路径与设备 ---
 data_dir: ./data
@@ -45,13 +45,13 @@ pretrain_lr: 5e-3
 pretrain_batch_size: 512
 scheduler_step: 50
 scheduler_gamma: 0.5
-mask_ratio: 0.5
-replace_ratio: 0.1
-drop_edge_rate: 0.2
+mask_ratio: 0.5       # GraphMAE 重建损失的掩码率
+replace_ratio: 0.1    # GraphMAE 重建损失的替换率
+drop_edge_rate: 0.2   # GraphMAE 重建损失的边丢弃率
 loss_fn: 'sce'
 alpha_l: 2.0
-w_contrastive: 0.3
-w_recon: 1.0
+w_contrastive: 0.3    # 预训练中对比损失的权重
+w_recon: 1.0          # 预训练中重建损失的权重
 
 # --- Uni-RHO-GAD 特定参数 ---
 all_tasks: 'ng' # 多图任务
@@ -61,11 +61,10 @@ w_gna: 5.0
 w_classification: 1.0
 
 # --- 数据增强控制 ---
-# 多图场景默认不使用我们设计的异常生成
-use_anomaly_generation: False
-use_node_aug: False
-use_edge_aug: False
-use_downstream_multi_graph_aug: False
-aug_ratio: 0.5
-aug_num_perturb_edges: 5
-aug_feature_mix_ratio: 0.5
+# 核心开关: 控制是否在微调阶段对多图进行在线增强
+use_downstream_multi_graph_aug: True # <--- 建议设为 True 来启用
+
+# 新增: 多图在线增强的具体参数 (仅在 use_downstream_multi_graph_aug 为 True 时生效)
+aug_drop_node_rate: 0.2
+aug_perturb_edge_rate: 0.2
+aug_mask_feature_rate: 0.2

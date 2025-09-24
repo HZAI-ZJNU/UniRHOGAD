@@ -33,7 +33,25 @@ class Trainer:
         self.args = args
         self.device = args.device
         
-        self.optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.l2)
+        # 1. 从 args 中获取一个新参数来控制是否冻结 RHOEncoder
+        freeze_rho_encoder = getattr(args, 'freeze_rho_encoder', False)
+
+        # 2. 根据参数构建要优化的参数列表
+        params_to_optimize = []
+        if freeze_rho_encoder:
+            print("--- [EXPERIMENT MODE] RHOEncoder is FROZEN. Only training fusion heads and centers. ---")
+            # 只将 fusion_heads 和 centers 的参数加入优化列表
+            params_to_optimize.extend(list(model.fusion_heads.parameters()))
+            params_to_optimize.extend(list(model.centers.parameters()))
+            # 注意：feature_adapter 通常也应该被训练
+            params_to_optimize.extend(list(model.feature_adapter.parameters()))
+        else:
+            print("--- [NORMAL MODE] Training all model parameters (end-to-end). ---")
+            # 训练所有参数
+            params_to_optimize = model.parameters()
+
+        # 3. 使用构建好的参数列表来初始化优化器
+        self.optimizer = torch.optim.Adam(params_to_optimize, lr=args.lr, weight_decay=args.l2)
 
         # 初始化时不设置alpha，因为我们将在forward时动态传入
         self.classification_loss_fn = FocalLoss(gamma=2, alpha=None, reduction="mean")
@@ -138,12 +156,29 @@ class Trainer:
             
             epoch_total_loss = 0
             pbar = tqdm(self.train_loader, desc=f"Epoch {epoch} Training", leave=False)
+
+            # 初始化计时器
+            time_profile = {
+                'collate': [], 'to_device': [], 'forward': [], 
+                'loss_calc': [], 'backward': [], 'step': []
+            }
+            
+            t_epoch_start = time.time() # 记录每个批次开始的时间点
+
             for data in pbar:
+
+                t_batch_start = time.time()
+
                 # collate_fn 返回 (原始图/批处理图, 标签字典, 任务图字典)
                 original_graph, batched_labels, task_graphs = data
 
+                time_profile['collate'].append(time.time() - t_batch_start)
+                t_after_collate = time.time()
+
+                # 使用 getattr 来安全地访问属性，如果不存在，则默认为 False
+                use_multi_graph_aug = getattr(self.args, 'use_downstream_multi_graph_aug', False)
                 # 这个逻辑只在多图场景下，并且开关打开时执行
-                if self.args.use_downstream_multi_graph_aug and not self.model.is_single_graph:
+                if use_multi_graph_aug and not self.model.is_single_graph:
                     # 确认我们有图可以增强
                     if 'g' in task_graphs:
                         g_batched = task_graphs['g']
@@ -161,9 +196,9 @@ class Trainer:
                             # 为下游训练创建一个增强视图
                             # 这里的增强参数可以硬编码，或者也加入到配置文件中
                             aug_graph_list.append(augment_graph_view(g, g_features, 
-                                                                     drop_node_rate=0.2, 
-                                                                     perturb_edge_rate=0.2, 
-                                                                     mask_feature_rate=0.2))
+                                                                     drop_node_rate=self.args.aug_drop_node_rate, 
+                                                                     perturb_edge_rate=self.args.aug_perturb_edge_rate, 
+                                                                     mask_feature_rate=self.args.aug_mask_feature_rate))
                         
                         # 用增强后的批处理图替换原来的图
                         task_graphs['g'] = dgl.batch(aug_graph_list)
@@ -173,6 +208,10 @@ class Trainer:
                 batched_labels = {k: v.to(self.device) for k, v in batched_labels.items()}
                 if original_graph:
                     original_graph = original_graph.to(self.device)
+
+                time_profile['to_device'].append(time.time() - t_after_collate)
+                t_after_to_device = time.time()
+
                 
                 # 准备 normal_masks 用于单类损失
                 normal_masks = {k: (v == 0) for k, v in batched_labels.items() if v.numel() > 0}
@@ -182,6 +221,9 @@ class Trainer:
                     original_graph=original_graph,
                     normal_masks=normal_masks
                 )
+
+                time_profile['forward'].append(time.time() - t_after_to_device)
+                t_after_forward = time.time()
 
                 # 计算总损失
                 loss_cls = 0
@@ -210,16 +252,36 @@ class Trainer:
                 loss = (self.args.w_classification * loss_cls +
                         self.args.w_gna * shared_losses.get('gna', 0) +
                         self.args.w_one_class * shared_losses.get('one_class', 0))
+
+                time_profile['loss_calc'].append(time.time() - t_after_forward)
+                t_after_loss_calc = time.time()
                 
                 self.optimizer.zero_grad()
                 loss.backward()
+
+                time_profile['backward'].append(time.time() - t_after_loss_calc)
+                t_after_backward = time.time()
+
                 self.optimizer.step()
                 
+                time_profile['step'].append(time.time() - t_after_backward)
+
                 epoch_total_loss += loss.item()
                 pbar.set_postfix(loss=loss.item())
             
             avg_train_loss = epoch_total_loss / len(self.train_loader) if len(self.train_loader) > 0 else 0
             print(f"Epoch {epoch:03d} | Avg Train Loss: {avg_train_loss:.4f}")
+
+            # --- 在每个 epoch 结束后打印平均耗时 ---
+            print(f"Epoch {epoch:03d} | Avg Train Loss: {avg_train_loss:.4f}")
+            print(f"--- Epoch {epoch:03d} Time Profile (Avg per batch) ---")
+            for key, values in time_profile.items():
+                avg_time = np.mean(values) if values else 0
+                print(f"  - Avg {key.capitalize():<12}: {avg_time:.6f} s")
+            print(f"  - Avg Total Batch Time: {np.mean([sum(times) for times in zip(*time_profile.values())]):.6f} s")
+            print(f"  - Total Epoch Time:     {time.time() - t_epoch_start:.2f} s")
+            print("-" * 40)
+
 
             # --- 验证阶段 ---
             val_metrics = self.evaluate('val')
