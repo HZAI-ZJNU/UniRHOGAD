@@ -141,9 +141,17 @@ class Uni_RHO_GAD_Predictor(nn.Module):
                 
                 if normal_masks and mask_key in normal_masks and normal_masks[mask_key].sum() > 0:
                     current_mask = normal_masks[mask_key]
+
+                    if not self.is_single_graph and task == 'n':
+                        # g_batch 是 batched_inputs['n']
+                        # dgl.broadcast_nodes 会自动处理广播
+                        node_level_mask = dgl.broadcast_nodes(g_batch, current_mask)
+                    else:
+                        node_level_mask = current_mask
+
                     # 确保掩码和张量的长度匹配
-                    if current_mask.shape[0] == task_level_rep.shape[0]:
-                        normal_reps = task_level_rep[current_mask]
+                    if node_level_mask.shape[0] == task_level_rep.shape[0]:
+                        normal_reps = task_level_rep[node_level_mask]
                         center = self.centers[task]
                         one_class_loss = torch.pow(normal_reps - center, 2).mean()
                         total_one_class_loss += one_class_loss

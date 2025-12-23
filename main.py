@@ -10,7 +10,7 @@ import time
 from functools import partial
 from data.dataset_loader import UniGADDataset, collate_fn_unify
 from models.pretrain_model import GraphMAE_PAA
-from models.ablation_models import Uni_RHO_GAD_Predictor_BaseGNN
+from models.ablation_models import Uni_RHO_GAD_Predictor_BaseGNN, Uni_RHO_GAD_Predictor_SimpleFusion
 from predictors.unirhogad_predictor import Uni_RHO_GAD_Predictor, Uni_RHO_GAD_Predictor_NoGNA
 from e2e_trainer import Trainer
 from utils.misc import set_seed
@@ -20,17 +20,21 @@ def get_args():
     """解析所有命令行参数"""
     parser = argparse.ArgumentParser("Uni-RHO-GAD End-to-End Training")
     parser.add_argument('--config', type=str, required=True, help="Path to the YAML configuration file for the experiment.")
-    # (可选) 允许命令行覆盖个别关键参数
     parser.add_argument('--device', type=str, default=None, help="Override the device setting in the config file.")
     parser.add_argument('--epochs', type=int, default=None, help="Override the epochs setting in the config file.")
 
     # 消融实验相关参数
     parser.add_argument('--ablation', type=str, default=None, 
-                    choices=['no_gna'], help="Specify which ablation study to run.")
+                    choices=['no_gna', 'simple_fusion', 'attention_fusion', 'no_pretrain', 'no_rho'], 
+                    help="Specify which ablation study to run.")
 
     parser.add_argument('--baseline', type=str, default=None, 
-                    choices=['gcn', 'gin'], # 您可以根据您实现的 GNN 扩展这个列表
+                    choices=['gcn', 'gin', 'graphsage', 'bwgnn'], # 您可以根据您实现的 GNN 扩展这个列表
                     help="Run a classic GNN baseline instead of the full model.")
+    
+    parser.add_argument('--freeze_rho', action='store_true', 
+                        help="If set, freeze the RHOEncoder during fine-tuning.")
+    
     return parser.parse_args()
 
 
@@ -51,6 +55,8 @@ def main(args):
         args.device = cmd_args.device
     if cmd_args.epochs is not None:
         args.epochs = cmd_args.epochs
+    if cmd_args.freeze_rho:
+        args.freeze_rho_encoder = True
 
     try:
         # 对所有可能使用科学记数法的浮点数参数进行转换
@@ -69,53 +75,72 @@ def main(args):
     print(f"--- Loading dataset: {args.dataset} ---")
     dataset = UniGADDataset(name=args.dataset, data_dir=args.data_dir)
     
-    # 为每个划分创建 DataLoader
-    # 我们只在一个 trial 上运行，所以 trial_id=0
     dataset.prepare_split(trial_id=0, seed=args.seed)
     train_subset = dataset.get_subset('train', trial_id=0)
     val_subset = dataset.get_subset('val', trial_id=0)
     test_subset = dataset.get_subset('test', trial_id=0)
+
+    print("--- Data Split Details ---")
+    if dataset.is_single_graph:
+        print(f"  Train: {len(train_subset.node_indices)} nodes, {len(train_subset.edge_indices)} edges. Total: {len(train_subset)}")
+        print(f"  Val:   {len(val_subset.node_indices)} nodes, {len(val_subset.edge_indices)} edges. Total: {len(val_subset)}")
+        print(f"  Test:  {len(test_subset.node_indices)} nodes, {len(test_subset.edge_indices)} edges. Total: {len(test_subset)}")
+    else:
+        print(f"  Train: {len(train_subset.graph_indices)} graphs. Total: {len(train_subset)}")
+        print(f"  Val:   {len(val_subset.graph_indices)} graphs. Total: {len(val_subset)}")
+        print(f"  Test:  {len(test_subset.graph_indices)} graphs. Total: {len(test_subset)}")
     
     anomaly_generator_instance = None
-    if args.use_anomaly_generation and dataset.is_single_graph:
-        # 从 dataset 中获取已经初始化好的 generator
+    use_anomaly_gen = getattr(args, 'use_anomaly_generation', False)
+    if use_anomaly_gen and dataset.is_single_graph:
         anomaly_generator_instance = dataset.anomaly_generator
 
     collate_with_aug = partial(
         collate_fn_unify, 
         sampler=dataset.sampler, 
         anomaly_generator=anomaly_generator_instance,
-        aug_ratio=args.aug_ratio,
-        num_perturb_edges=args.aug_num_perturb_edges,
-        feature_mix_ratio=args.aug_feature_mix_ratio,
-        use_node_aug=args.use_node_aug,
-        use_edge_aug=args.use_edge_aug
+        aug_ratio=getattr(args, 'aug_ratio', 0.5),
+        num_perturb_edges=getattr(args, 'aug_num_perturb_edges', 5),
+        feature_mix_ratio=getattr(args, 'aug_feature_mix_ratio', 0.5),
+        use_node_aug=getattr(args, 'use_node_aug', False),
+        use_edge_aug=getattr(args, 'use_edge_aug', False)
     )
 
     train_loader = torch.utils.data.DataLoader(train_subset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_with_aug)
     val_loader = torch.utils.data.DataLoader(val_subset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_with_aug)
     test_loader = torch.utils.data.DataLoader(test_subset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_with_aug)
-
-    print(f"Train samples: {len(train_subset)}, Val samples: {len(val_subset)}, Test samples: {len(test_subset)}")
+    
+    # test_masks = dataset.split_masks[0]['test']
+    # test_node_ids = test_masks['n']
+    # if test_node_ids.numel() > 0:
+    #     node_labels = dataset.graph_list[0].ndata['node_label']
+    #     test_labels = node_labels[test_node_ids]
+    #     anomaly_indices_in_test = (test_labels == 1).nonzero(as_tuple=True)[0]
+    #     if anomaly_indices_in_test.numel() > 0:
+    #         # 打印前5个测试集中的异常节点的原始ID
+    #         print("Sample anomaly node IDs from test set:")
+    #         print(test_node_ids[anomaly_indices_in_test[:5]].tolist())
 
     # 2. ==================== 模型构建 ====================
     print("--- Building models ---")
-    # a. 加载预训练的GraphMAE_PAA模型 (仅用于特征提取)
-    # 注意：这里的参数需要与你预训练时使用的参数大致匹配
     print(f"Instantiating pretrained model architecture: enc={args.pretrain_encoder_type}, dec={args.pretrain_decoder_type}, hid={args.pretrain_hid_dim}")
     pretrain_model = GraphMAE_PAA(
-        in_dim=dataset.in_dim,
-        hid_dim=args.pretrain_hid_dim,
-        encoder_num_layer=args.pretrain_encoder_num_layer,
-        decoder_num_layer=args.pretrain_decoder_num_layer,
-        encoder_type=args.pretrain_encoder_type,
-        decoder_type=args.pretrain_decoder_type
+        in_dim=dataset.in_dim, hid_dim=args.pretrain_hid_dim,
+        encoder_num_layer=args.pretrain_encoder_num_layer, decoder_num_layer=args.pretrain_decoder_num_layer,
+        encoder_type=args.pretrain_encoder_type, decoder_type=args.pretrain_decoder_type
     )
-    print(f"Loading pretrained weights from {args.pretrain_path}")
-    pretrain_model.load_state_dict(torch.load(args.pretrain_path, map_location=args.device, weights_only=True))
-    pretrain_model.eval()  # 切换到评估模式
+    
+    # 根据 ablation 标志决定是否加载预训练权重
+    if cmd_args.ablation == 'no_pretrain':
+        print("\n--- [ABLATION MODE] Running WITHOUT pre-trained weights. Using randomly initialized encoder. ---\n")
+    else:
+        print(f"Loading pretrained weights from {args.pretrain_path}")
+        try:
+            pretrain_model.load_state_dict(torch.load(args.pretrain_path, map_location=args.device, weights_only=True))
+        except FileNotFoundError:
+            print(f"!!! WARNING: Pre-trained model not found at {args.pretrain_path}. The model will use random initialization. !!!")
+    pretrain_model.eval()
 
-    # 创建特征适配器，以处理预训练输出维度和主模型输入维度不匹配的情况
     pretrain_output_dim = pretrain_model.embed_dim
     if pretrain_output_dim != args.hid_dim:
         print(f"Dimension mismatch: Adapting pretrained output from {pretrain_output_dim} to main model dim {args.hid_dim}.")
@@ -123,55 +148,49 @@ def main(args):
     else:
         feature_adapter = nn.Identity()
 
-    # b. 构建我们的主模型 Uni_RHO_GAD_Predictor
-    # 传入 cross_modes 列表
     cross_modes_list = args.cross_modes.split(',')
     all_tasks_list = list(args.all_tasks)
-    # model = Uni_RHO_GAD_Predictor(
-    #     pretrain_model=pretrain_model,
-    #     feature_adapter=feature_adapter,
-    #     is_single_graph=dataset.is_single_graph,
-    #     embed_dims=args.hid_dim,
-    #     num_classes=2, # 异常/正常
-    #     all_tasks=all_tasks_list,
-    #     cross_modes=cross_modes_list,
-    #     base_gnn_layers=args.base_gnn_layers,
-    #     final_mlp_layers=args.final_mlp_layers,
-    #     gna_projection_dim=args.gna_proj_dim,
-    #     dropout_rate=args.dropout,
-    #     activation=args.activation,
-    #     residual=args.residual,
-    #     norm=args.norm
-    # )
 
     model_args = {
-        "pretrain_model": pretrain_model,
-        "feature_adapter": feature_adapter,
-        "is_single_graph": dataset.is_single_graph,
-        "embed_dims": args.hid_dim,
-        "num_classes": 2,
-        "all_tasks": all_tasks_list,
-        "cross_modes": cross_modes_list,
-        "base_gnn_layers": args.base_gnn_layers,
-        "final_mlp_layers": args.final_mlp_layers,
-        "gna_projection_dim": args.gna_proj_dim,
-        "dropout_rate": args.dropout,
-        "activation": args.activation,
-        "residual": args.residual,
-        "norm": args.norm
+        "pretrain_model": pretrain_model, "feature_adapter": feature_adapter,
+        "is_single_graph": dataset.is_single_graph, "embed_dims": args.hid_dim,
+        "num_classes": 2, "all_tasks": all_tasks_list, "cross_modes": cross_modes_list,
+        "base_gnn_layers": args.base_gnn_layers, "final_mlp_layers": args.final_mlp_layers,
+        "gna_projection_dim": args.gna_proj_dim, "dropout_rate": args.dropout,
+        "activation": args.activation, "residual": args.residual, "norm": args.norm
     }
-    # --- 核心修改：添加基线模型选择逻辑 ---
+    
+    # --- 整合后的模型选择逻辑 ---
     if cmd_args.baseline:
         print(f"--- Running Baseline Experiment: {cmd_args.baseline.upper()} ---")
-        # 将基线类型作为参数传入
+        args.model_type_tag = f"baseline_{cmd_args.baseline}"
         model = Uni_RHO_GAD_Predictor_BaseGNN(base_gnn_type=cmd_args.baseline, **model_args)
-    elif cmd_args.ablation == 'no_gna':
-        print("--- Running Ablation Study: No GNA ---")
-        model = Uni_RHO_GAD_Predictor_NoGNA(**model_args)
+    elif cmd_args.ablation:
+        print(f"--- Running Ablation Study: {cmd_args.ablation.upper()} ---")
+        args.model_type_tag = f"ablation_{cmd_args.ablation}"
+        
+        if cmd_args.ablation == 'no_gna':
+            model = Uni_RHO_GAD_Predictor_NoGNA(**model_args)
+        elif cmd_args.ablation in ['simple_fusion', 'attention_fusion']:
+            mode_map = {'simple_fusion': 'concat', 'attention_fusion': 'attention'}
+            current_fusion_mode = mode_map[cmd_args.ablation]
+            print(f"--- [ABLATION MODE] Using SimpleFusion head with '{current_fusion_mode}' mode. ---")
+            # 传递 fusion_mode 参数
+            model = Uni_RHO_GAD_Predictor_SimpleFusion(fusion_mode=current_fusion_mode, **model_args)
+        elif cmd_args.ablation == 'no_pretrain':
+            # 模型架构不变，只是预训练模型是随机初始化的
+            model = Uni_RHO_GAD_Predictor(**model_args)
+        elif cmd_args.ablation == 'no_rho':
+            # 用基础GCN替换RHOEncoder
+            print("--- [ABLATION MODE] Replacing RHOEncoder with standard GCN. ---")
+            model = Uni_RHO_GAD_Predictor_BaseGNN(base_gnn_type='gcn', **model_args)
+        else:
+            raise ValueError(f"Unknown ablation option: {cmd_args.ablation}")
     else:
         print("--- Running Full Model: Uni_RHO_GAD_Predictor ---")
+        args.model_type_tag = "full_model"
         model = Uni_RHO_GAD_Predictor(**model_args)
-    # --- 修改结束 ---
+
 
     # 3. ==================== 训练启动 ====================
     print("--- Initializing Trainer ---")

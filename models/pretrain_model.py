@@ -11,7 +11,7 @@ import numpy as np
 import dgl
 from dgl import DGLGraph
 
-from gnn_zoo.homogeneous_gnns import GCN, GIN, BWGNN
+from gnn_zoo.homogeneous_gnns import GCN, GIN, BWGNN, GraphSAGE
 from utils.misc import obtain_act, obtain_norm, sce_loss
 from data.anomaly_generator import AnomalyGenerator
 
@@ -171,6 +171,18 @@ class GraphMAE_PAA(nn.Module):
             encoder_out_dim = hid_dim * (self.encoder.d + 1)
             self.embed_dim = encoder_out_dim
             decoder_in_dim = encoder_out_dim # 解码器的输入维度也需要相应改变
+        elif encoder_type == 'graphsage':
+            self.encoder = GraphSAGE(
+                in_dim=in_dim,
+                num_hidden=hid_dim,
+                out_dim=hid_dim,
+                num_layers=encoder_num_layer,
+                dropout=0.0, # 预训练时 dropout 通常设为 0
+                activation=activation,
+                residual=residual,
+                norm=norm,
+                encoding=True # 确保输出带有激活
+            )
         else:
             raise NotImplementedError(f"Encoder type '{encoder_type}' not supported.")
 
@@ -180,6 +192,22 @@ class GraphMAE_PAA(nn.Module):
         print(f"Initializing GraphMAE_PAA Decoder: {decoder_type.upper()}")
         if decoder_type == "gcn":
             self.decoder = GCN(decoder_in_dim, hid_dim, in_dim, decoder_num_layer, 0.0, activation, residual, norm, encoding=False)
+        elif decoder_type == "gin":
+            self.decoder = GIN(decoder_in_dim, hid_dim, in_dim, decoder_num_layer, 0.0, activation, residual, norm, encoding=False)
+        elif decoder_type == "bwgnn":
+            self.decoder = BWGNN(in_dim=decoder_in_dim, num_hidden=hid_dim, encoding=False)
+        elif decoder_type == 'graphsage':
+            self.decoder = GraphSAGE(
+                in_dim=decoder_in_dim,
+                num_hidden=hid_dim,
+                out_dim=in_dim, # 解码器输出维度是原始特征维度
+                num_layers=decoder_num_layer, # 使用独立的解码器层数
+                dropout=0.0,
+                activation=activation,
+                residual=residual,
+                norm=norm,
+                encoding=False # 解码器最后一层不加激活
+            )
         elif decoder_type == "mlp":
             # 使用一个简单的多层MLP作为解码器
             layers = [nn.Linear(decoder_in_dim, hid_dim), nn.ReLU()]

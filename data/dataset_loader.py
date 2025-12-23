@@ -360,7 +360,7 @@ class UniGADDataset(torch.utils.data.Dataset):
         # 定义单图数据集的简称列表 (除了这些都是多图)
         SINGLEGRAPH_NAMES = [
             'reddit', 'weibo', 'amazon', 'yelp', 
-            'tfinance', 'tolokers', 'questions'
+            'tfinance', 'tolokers', 'questions', 'amazon_no_purify', 'yelp_no_purify'
         ]
 
         if name in SINGLEGRAPH_NAMES:
@@ -451,7 +451,7 @@ class UniGADDataset(torch.utils.data.Dataset):
                     scaled_features = scaler.transform(features.numpy())
                     g.ndata['feature'] = torch.from_numpy(scaled_features).float()
 
-    def prepare_split(self, trial_id=0, train_ratio=0.4, val_ratio=0.2, seed=42):
+    def prepare_split(self, trial_id=0, seed=42):
         """为指定的实验次数(trial_id)准备数据划分"""
         if trial_id in self.split_masks:
             return self.split_masks[trial_id]
@@ -459,6 +459,23 @@ class UniGADDataset(torch.utils.data.Dataset):
         print(f"Preparing split for trial {trial_id} with seed {seed}...")
         np.random.seed(seed)
         torch.manual_seed(seed)
+
+        # 默认划分比例
+        train_ratio, val_ratio = 0.4, 0.2 
+        # 根据 UniGAD 论文 Table 1 进行定制
+        if self.name in ['amazon', 'yelp', 'amazon_no_purify', 'yelp_no_purify']:
+            train_ratio, val_ratio = 0.7, 0.1 # 70% 训练, 10% 验证, 20% 测试
+        elif self.name in ['tolokers', 'questions', 'tfinance']:
+            train_ratio, val_ratio = 0.5, 0.25 # 50% 训练, 25% 验证, 25% 测试
+        elif self.name in ['reddit', 'weibo']:
+            train_ratio, val_ratio = 0.4, 0.2 # 40% 训练, 20% 验证, 40% 测试
+        # 对于多图数据集，也可以添加类似逻辑
+        elif self.name in ['bm/dgl/bm_mn_dgl', 'bm/dgl/bm_ms_dgl', 'bm/dgl/bm_mt_dgl', 'mutag/dgl/mutag', 'TGroup']:
+             train_ratio, val_ratio = 0.4, 0.2 # UniGAD 也是 40%
+        elif self.name in ['mnist_processed/mnist0_strict', 'mnist_processed/mnist1_strict']:
+             train_ratio, val_ratio = 0.1, 0.1 # UniGAD 是 10%
+
+        print(f"  - Using split ratio for '{self.name}': train={train_ratio*100}%, val={val_ratio*100}%")
 
         if self.is_single_graph:
             g = self.graph_list[0]

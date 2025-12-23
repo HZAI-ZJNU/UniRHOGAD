@@ -2,22 +2,26 @@
 #   Base Configuration for Single-Graph Datasets
 # ======================================================================
 
-# e.g. 'reddit', 'amazon', 'yelp', 'weibo', 'questions', 'tolokers', 'tfinance'
-dataset: 'yelp'
+# e.g. 'reddit', 'weibo', 'amazon', 'yelp', 'questions', 'tolokers', 'tfinance'
+dataset: 'amazon_no_purify'
 
 # --- 路径与设备 ---
 data_dir: ./data
 results_dir: ./results
 save_dir: ./pretrained
+checkpoint_dir: './checkpoints'
 device: cuda
 
 # --- 训练控制 ---
 seed: 42
 num_trials: 5
-epochs: 10
+epochs: 100
 patience: 30
 batch_size: 64
-metric: AUPRC
+composite_score_weights:
+  AUPRC: 2.0   # 对于 Reddit，我们将 AUPRC 的权重设为 0
+  AUROC: 0.5   # 将 AUROC 的权重设为 1.0，使其成为主导指标
+  MacroF1: 0.0 # MacroF1 仍然不参与
 
 # --- 模型与优化器 ---
 lr: 5e-4
@@ -32,7 +36,7 @@ final_mlp_layers: 2
 gna_proj_dim: 128
 
 # --- 预训练模型架构 ---
-pretrain_path: './pretrained/yelp_enc_gcn2_dec_gcn1_e100_h128_loss_sce.pt'
+pretrain_path: './pretrained/amazon_no_purify_enc_gcn2_dec_gcn1_e100_h128_loss_sce.pt'
 pretrain_encoder_type: 'gcn'
 pretrain_decoder_type: 'gcn'
 pretrain_hid_dim: 128
@@ -50,7 +54,7 @@ replace_ratio: 0.1
 drop_edge_rate: 0.2
 loss_fn: 'sce'
 alpha_l: 2.0
-w_contrastive: 0.3
+w_contrastive: 0.5
 w_recon: 1.0
 
 # --- Uni-RHO-GAD 特定参数 ---
@@ -66,9 +70,9 @@ w_classification_e: 0.5 # 降低边任务的权重
 freeze_rho_encoder: False
 
 # --- 数据增强控制 ---
-use_anomaly_generation: False
-use_node_aug: False  # 在异质图转同质图的amazon和yelp任务以及weibo中我们不启用节点增强
-use_edge_aug: False
+use_anomaly_generation: false
+use_node_aug: false
+use_edge_aug: false                                                           
 # use_downstream_multi_graph_aug: False
 aug_ratio: 0.5
 aug_num_perturb_edges: 5

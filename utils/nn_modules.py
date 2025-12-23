@@ -178,3 +178,99 @@ class GraphStitchHead(nn.Module):
         
 
         return logits_dict
+
+    
+# ======================================================================
+#   GraphStitchHead_SimpleFusion: 带有简单融合的消融实验版本
+# ======================================================================
+class GraphStitchHead_SimpleFusion(GraphStitchHead):
+    """
+    GraphStitchHead的消融实验版本，实现了多种简单的信息融合策略。
+    它继承自原始的 GraphStitchHead，只重写 forward 方法以处理单图场景。
+    """
+    def __init__(self, fusion_mode='concat', *args, **kwargs):
+        # 消费掉 fusion_mode, 然后安全地调用父类
+        super().__init__(*args, **kwargs)
+        
+        self.fusion_mode = fusion_mode
+        embed_dim = kwargs.get('embed_dim', 0)
+        num_classes = kwargs.get('num_classes', 2)
+        
+        if self.fusion_mode == 'concat':
+            # 拼接模式下，输入维度加倍
+            fused_embed_dim = embed_dim * 2
+            self.fused_predictors = nn.ModuleDict({
+                task: MLP(fused_embed_dim, embed_dim, num_classes, 
+                          num_layers=kwargs.get('mlp_layers', 2), 
+                          dropout_rate=kwargs.get('dropout_rate', 0.5), 
+                          activation=kwargs.get('activation', 'ReLU'))
+                for task in self.output_route
+            })
+        elif self.fusion_mode == 'attention':
+            # 注意力模式下，我们学习一个权重 alpha
+            self.attention_net = nn.ModuleDict()
+            for task in self.output_route:
+                # 输入是拼接的 [local_rep, global_context]，输出是单个标量 alpha
+                self.attention_net[task] = nn.Sequential(
+                    nn.Linear(embed_dim * 2, embed_dim),
+                    nn.Tanh(),
+                    nn.Linear(embed_dim, 1),
+                    nn.Sigmoid()
+                )
+                
+    def forward(self, branch_representations: dict, is_single_graph: bool = False,
+                 graph_for_node_task: dgl.DGLGraph=None) -> dict:
+        """
+        重写的 forward 方法。如果是在单图场景，则执行融合逻辑。
+        否则，调用父类的原始方法处理多图场景。
+        """
+        if not is_single_graph:
+            # 对于多图场景，行为与父类完全相同
+            return super().forward(branch_representations, is_single_graph, graph_for_node_task)
+
+        # --- 单图场景：执行融合逻辑 ---
+        logits_dict = {}
+        
+        node_rep = branch_representations.get('n')
+        edge_rep = branch_representations.get('e')
+        
+        # 池化表示以获得图级别的上下文
+        graph_context_from_edges = edge_rep.mean(dim=0, keepdim=True) if edge_rep is not None else None
+        graph_context_from_nodes = node_rep.mean(dim=0, keepdim=True) if node_rep is not None else None
+
+        # 1. 预测节点任务
+        if 'n' in self.predictors and node_rep is not None:
+            if graph_context_from_edges is not None:
+                context_expanded = graph_context_from_edges.expand(node_rep.shape[0], -1)
+                
+                if self.fusion_mode == 'concat':
+                    fused_rep = torch.cat([node_rep, context_expanded], dim=1)
+                    logits_dict['n'] = self.fused_predictors['n'](fused_rep)
+                elif self.fusion_mode == 'attention':
+                    attention_input = torch.cat([node_rep, context_expanded], dim=1)
+                    alpha = self.attention_net['n'](attention_input)
+                    fused_rep = (1 - alpha) * node_rep + alpha * context_expanded
+                    # 注意力模式下维度不变，复用父类的 predictors
+                    logits_dict['n'] = self.predictors['n'](fused_rep)
+            else:
+                # 如果没有全局上下文，则独立预测
+                logits_dict['n'] = self.predictors['n'](node_rep)
+
+        # 2. 预测边任务 (逻辑与节点任务类似)
+        if 'e' in self.predictors and edge_rep is not None:
+            if graph_context_from_nodes is not None:
+                context_expanded = graph_context_from_nodes.expand(edge_rep.shape[0], -1)
+
+                if self.fusion_mode == 'concat':
+                    fused_rep = torch.cat([edge_rep, context_expanded], dim=1)
+                    logits_dict['e'] = self.fused_predictors['e'](fused_rep)
+                elif self.fusion_mode == 'attention':
+                    attention_input = torch.cat([edge_rep, context_expanded], dim=1)
+                    alpha = self.attention_net['e'](attention_input)
+                    fused_rep = (1 - alpha) * edge_rep + alpha * context_expanded
+                    logits_dict['e'] = self.predictors['e'](fused_rep)
+            else:
+                # 如果没有全局上下文，则独立预测
+                logits_dict['e'] = self.predictors['e'](edge_rep)
+
+        return logits_dict

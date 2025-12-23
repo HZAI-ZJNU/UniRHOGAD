@@ -11,7 +11,7 @@ import dgl.function as fn
 from dgl.utils import expand_as_pair
 import sympy
 import scipy
-
+from dgl.nn.pytorch.conv import SAGEConv
 from utils.misc import obtain_act, obtain_norm
 
 class GCN(nn.Module):
@@ -499,3 +499,111 @@ class BWGNN(nn.Module):
         if self.dropout:
             raise NotImplementedError
         return h_final
+
+####################
+#     GraphSAGE
+####################
+class GraphSAGE(nn.Module):
+    def __init__(self,
+                 in_dim,
+                 num_hidden,
+                 out_dim,
+                 num_layers,
+                 dropout,
+                 activation,
+                 residual,
+                 norm,
+                 aggregator_type='mean',
+                 encoding=False
+                 ):
+        super(GraphSAGE, self).__init__()
+        self.out_dim = out_dim
+        self.num_layers = num_layers
+        self.sage_layers = nn.ModuleList()
+        self.activation = activation
+        self.dropout = dropout
+        self.residual = residual
+
+        # --- 核心修改：将 Norm 层独立出来 ---
+        self.norms = nn.ModuleList()
+        norm_layer_class = obtain_norm(norm)
+        # --- 修改结束 ---
+
+        last_activation = obtain_act(activation) if encoding else None
+        
+        if num_layers == 1:
+            # --- 核心修改：移除 SAGEConv 中的 norm 参数 ---
+            self.sage_layers.append(SAGEConv(
+                in_dim, out_dim, aggregator_type, feat_drop=dropout,
+                activation=last_activation
+            ))
+            if norm != 'none': self.norms.append(norm_layer_class(out_dim))
+            # --- 修改结束 ---
+        else:
+            # Input layer
+            self.sage_layers.append(SAGEConv(
+                in_dim, num_hidden, aggregator_type, feat_drop=dropout,
+                activation=obtain_act(activation)
+            ))
+            if norm != 'none': self.norms.append(norm_layer_class(num_hidden))
+
+            # Hidden layers
+            for l in range(1, num_layers - 1):
+                self.sage_layers.append(SAGEConv(
+                    num_hidden, num_hidden, aggregator_type, feat_drop=dropout,
+                    activation=obtain_act(activation)
+                ))
+                if norm != 'none': self.norms.append(norm_layer_class(num_hidden))
+
+            # Output layer
+            self.sage_layers.append(SAGEConv(
+                num_hidden, out_dim, aggregator_type, feat_drop=dropout,
+                activation=last_activation
+            ))
+            if norm != 'none' and encoding: self.norms.append(norm_layer_class(out_dim))
+        
+        if residual:
+            self.res_connections = nn.ModuleList()
+            if num_layers == 1:
+                self.res_connections.append(nn.Linear(in_dim, out_dim, bias=False) if in_dim != out_dim else nn.Identity())
+            else:
+                self.res_connections.append(nn.Linear(in_dim, num_hidden, bias=False) if in_dim != num_hidden else nn.Identity())
+                for _ in range(num_layers - 2):
+                    self.res_connections.append(nn.Identity())
+                self.res_connections.append(nn.Linear(num_hidden, out_dim, bias=False) if num_hidden != out_dim else nn.Identity())
+
+        self.head = nn.Identity()
+
+    def forward(self, g, inputs, return_hidden=False):
+        if inputs.dtype == torch.long:
+            h = inputs.float()
+        else:
+            h = inputs
+        
+        hidden_list = []
+        for l in range(self.num_layers):
+            h_in = h
+            h = F.dropout(h, p=self.dropout, training=self.training) # 将 dropout 移到卷积之前
+            h = self.sage_layers[l](g, h)
+            
+            # --- 核心修改：手动应用残差和归一化 ---
+            if self.residual:
+                h = h + self.res_connections[l](h_in)
+            
+            # 只有在非输出层，或者输出层是编码器时，才应用 norm
+            if l < self.num_layers - 1:
+                if self.norms: h = self.norms[l](h)
+            else: # last layer
+                if self.norms and len(self.norms) == self.num_layers:
+                    h = self.norms[l](h)
+            # --- 修改结束 ---
+            
+            hidden_list.append(h)
+        
+        if return_hidden:
+            return self.head(h), hidden_list
+        else:
+            return self.head(h)
+
+    def reset_classifier(self, num_classes):
+        self.head = nn.Linear(self.out_dim, num_classes)

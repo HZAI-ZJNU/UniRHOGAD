@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 import dgl.function as fn
 from tqdm import tqdm
+import os
 import numpy as np
 import pprint 
 import dgl
@@ -15,6 +16,7 @@ from predictors.unirhogad_predictor import Uni_RHO_GAD_Predictor
 from data.anomaly_generator import AnomalyGenerator
 from models.pretrain_model import augment_graph_view
 from utils.misc import get_current_lr
+import glob
 
 class Trainer:
     def __init__(self,  model, train_loader, val_loader, test_loader, args):
@@ -50,11 +52,93 @@ class Trainer:
             # 训练所有参数
             params_to_optimize = model.parameters()
 
+        # 生成唯一的实验 ID
+        self.experiment_id = self._generate_experiment_id()
+        print(f"--- Initializing Trainer for Experiment ID: {self.experiment_id} ---")
+
         # 3. 使用构建好的参数列表来初始化优化器
         self.optimizer = torch.optim.Adam(params_to_optimize, lr=args.lr, weight_decay=args.l2)
 
         # 初始化时不设置alpha，因为我们将在forward时动态传入
         self.classification_loss_fn = FocalLoss(gamma=2, alpha=None, reduction="mean")
+
+        # --- 断点续训相关属性 ---
+        self.start_epoch = 1
+        self.best_val_score = -1.0
+        self.patience_counter = 0
+        self.checkpoint_dir = getattr(args, 'checkpoint_dir', './checkpoints')
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        
+        # --- 尝试加载最新的检查点 ---
+        self._load_checkpoint()
+
+    def _generate_experiment_id(self):
+        """根据关键配置生成一个唯一的文件名/ID前缀"""
+        
+        # 1. 数据集和种子
+        dataset_name = self.args.dataset.replace('/', '_')
+        exp_id = f"{dataset_name}_seed{self.args.seed}"
+        
+        # 2. 模型类型 (完整/消融/基线)
+        #    注意：这里需要从命令行参数 cmd_args 获取，而不是 args
+        #    我们需要稍微调整 main.py 来传递它
+        model_type = getattr(self.args, 'model_type_tag', 'full') # 默认为 'full'
+        exp_id += f"_model_{model_type}"
+
+        # 3. 数据增强状态
+        use_aug = False
+        if self.model.is_single_graph:
+            use_aug = getattr(self.args, 'use_anomaly_generation', False)
+        else:
+            use_aug = getattr(self.args, 'use_downstream_multi_graph_aug', False)
+        
+        aug_tag = "augOn" if use_aug else "augOff"
+        exp_id += f"_{aug_tag}"
+        
+        return exp_id
+
+    def _save_checkpoint(self, epoch, is_best=False):
+        """保存模型状态到检查点文件"""
+        state = {
+            'epoch': epoch + 1,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'best_val_score': self.best_val_score,
+            'patience_counter': self.patience_counter
+        }
+        
+        # 为每个实验创建一个专属的检查点文件名
+        # 这样不同实验的检查点不会相互覆盖
+        filename_prefix = f"{self.args.dataset}_{self.args.seed}"
+        
+        # 保存最新的检查点
+        latest_checkpoint_path = os.path.join(self.checkpoint_dir, f"{self.experiment_id}_latest.pth")
+        torch.save(state, latest_checkpoint_path)
+        print(f"\nCheckpoint saved to {latest_checkpoint_path} at epoch {epoch}")
+
+        # 如果是最佳模型，额外保存一份
+        if is_best:
+            best_checkpoint_path = os.path.join(self.checkpoint_dir, f"{self.experiment_id}_best.pth")
+            torch.save(state, best_checkpoint_path)
+            print(f"\nEpoch {epoch}: Best model checkpoint saved to {best_checkpoint_path}")
+
+    def _load_checkpoint(self):
+        """加载最新的检查点文件以恢复训练"""
+        latest_checkpoint_path = os.path.join(self.checkpoint_dir, f"{self.experiment_id}_latest.pth")
+
+        if os.path.isfile(latest_checkpoint_path):
+            print(f"--- Found checkpoint, loading from {latest_checkpoint_path} ---")
+            checkpoint = torch.load(latest_checkpoint_path, map_location=self.device)
+            
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.start_epoch = checkpoint['epoch']
+            self.best_val_score = checkpoint['best_val_score']
+            self.patience_counter = checkpoint['patience_counter']
+            
+            print(f"--- Resuming training from epoch {self.start_epoch} ---")
+        else:
+            print("--- No checkpoint found, starting training from scratch. ---")
 
 
     def _get_best_f1(self, labels, probs):
@@ -120,19 +204,17 @@ class Trainer:
         # --- 策略：对所有我们关心的任务和指标，进行加权平均 ---
         scores = []
         weights = []
+
+        score_weights = getattr(self.args, 'composite_score_weights', {'AUPRC': 1.0, 'AUROC': 0.5, 'MacroF1': 0.0})
         
         # 遍历所有 cross_modes
         for mode, tasks_metrics in metrics_dict.items():
             # 遍历该模式下的所有任务
             for task, metrics in tasks_metrics.items():
-                # 遍历我们关心的指标
-                if 'AUPRC' in metrics:
-                    # 我们可以给 AUPRC 更高的权重，因为它更重要
-                    scores.append(metrics['AUPRC'])
-                    weights.append(1.0) # AUPRC 权重为 1.0
-                if 'AUROC' in metrics:
-                    scores.append(metrics['AUROC'])
-                    weights.append(0.5) # AUROC 权重为 0.5 (可以调整)
+                for metric_name, weight in score_weights.items():
+                    if metric_name in metrics and weight > 0:
+                        scores.append(metrics[metric_name])
+                        weights.append(weight)
 
         if not scores:
             return -1.0 # 如果没有任何有效分数
@@ -143,12 +225,10 @@ class Trainer:
 
     def train(self):
         """执行完整的训练、验证和早停流程"""
-        best_composite_score = -1.0
-        patience_counter = 0
         best_test_metrics = None
         start_time = time.time()
 
-        for epoch in range(1, self.args.epochs + 1):
+        for epoch in range(self.start_epoch, self.args.epochs + 1):
             # --- 训练阶段 ---
             self.model.train()
             # 预训练模型始终处于评估模式
@@ -157,23 +237,9 @@ class Trainer:
             epoch_total_loss = 0
             pbar = tqdm(self.train_loader, desc=f"Epoch {epoch} Training", leave=False)
 
-            # 初始化计时器
-            time_profile = {
-                'collate': [], 'to_device': [], 'forward': [], 
-                'loss_calc': [], 'backward': [], 'step': []
-            }
-            
-            t_epoch_start = time.time() # 记录每个批次开始的时间点
-
             for data in pbar:
-
-                t_batch_start = time.time()
-
                 # collate_fn 返回 (原始图/批处理图, 标签字典, 任务图字典)
                 original_graph, batched_labels, task_graphs = data
-
-                time_profile['collate'].append(time.time() - t_batch_start)
-                t_after_collate = time.time()
 
                 # 使用 getattr 来安全地访问属性，如果不存在，则默认为 False
                 use_multi_graph_aug = getattr(self.args, 'use_downstream_multi_graph_aug', False)
@@ -201,7 +267,35 @@ class Trainer:
                                                                      mask_feature_rate=self.args.aug_mask_feature_rate))
                         
                         # 用增强后的批处理图替换原来的图
-                        task_graphs['g'] = dgl.batch(aug_graph_list)
+                        # task_graphs['g'] = dgl.batch(aug_graph_list)
+                        # 强制统一所有增强后图的模式，以解决 TGroup 数据集上的 dgl.batch 错误
+                        cleaned_aug_graph_list = []
+                        for aug_g in aug_graph_list:
+                            if aug_g.num_nodes() == 0:
+                                # 跳过或处理空图，防止 dgl.graph 报错
+                                continue
+                            
+                            # 1. 创建一个只有结构的新图
+                            new_g = dgl.graph(aug_g.edges(), num_nodes=aug_g.num_nodes())
+                            
+                            # 2. 以固定的顺序，只迁移我们绝对需要的特征
+                            if dgl.NID in aug_g.ndata:
+                                new_g.ndata[dgl.NID] = aug_g.ndata[dgl.NID]
+                            
+                            if 'feature' in aug_g.ndata:
+                                new_g.ndata['feature'] = aug_g.ndata['feature']
+                            
+                            # 3. 将这个干净、模式统一的图加入新列表
+                            cleaned_aug_graph_list.append(new_g)
+                        
+                        # 使用清洗后的图列表进行批处理
+                        if cleaned_aug_graph_list: # 确保列表不为空
+                            task_graphs['g'] = dgl.batch(cleaned_aug_graph_list)
+                        else:
+                            # 如果所有图都变为空图，需要处理这种情况
+                            # 例如，创建一个空的批处理图或跳过这个批次
+                            # 这里我们简单地保留原始图，避免崩溃
+                            task_graphs['g'] = g_batched # 或者其他适当的处理方式   
                 
                 # 将所有数据移动到设备
                 task_graphs = {k: v.to(self.device) for k, v in task_graphs.items()}
@@ -209,10 +303,6 @@ class Trainer:
                 if original_graph:
                     original_graph = original_graph.to(self.device)
 
-                time_profile['to_device'].append(time.time() - t_after_collate)
-                t_after_to_device = time.time()
-
-                
                 # 准备 normal_masks 用于单类损失
                 normal_masks = {k: (v == 0) for k, v in batched_labels.items() if v.numel() > 0}
 
@@ -221,9 +311,6 @@ class Trainer:
                     original_graph=original_graph,
                     normal_masks=normal_masks
                 )
-
-                time_profile['forward'].append(time.time() - t_after_to_device)
-                t_after_forward = time.time()
 
                 # 计算总损失
                 loss_cls = 0
@@ -252,36 +339,17 @@ class Trainer:
                 loss = (self.args.w_classification * loss_cls +
                         self.args.w_gna * shared_losses.get('gna', 0) +
                         self.args.w_one_class * shared_losses.get('one_class', 0))
-
-                time_profile['loss_calc'].append(time.time() - t_after_forward)
-                t_after_loss_calc = time.time()
                 
                 self.optimizer.zero_grad()
                 loss.backward()
 
-                time_profile['backward'].append(time.time() - t_after_loss_calc)
-                t_after_backward = time.time()
-
                 self.optimizer.step()
-                
-                time_profile['step'].append(time.time() - t_after_backward)
 
                 epoch_total_loss += loss.item()
                 pbar.set_postfix(loss=loss.item())
             
             avg_train_loss = epoch_total_loss / len(self.train_loader) if len(self.train_loader) > 0 else 0
             print(f"Epoch {epoch:03d} | Avg Train Loss: {avg_train_loss:.4f}")
-
-            # --- 在每个 epoch 结束后打印平均耗时 ---
-            print(f"Epoch {epoch:03d} | Avg Train Loss: {avg_train_loss:.4f}")
-            print(f"--- Epoch {epoch:03d} Time Profile (Avg per batch) ---")
-            for key, values in time_profile.items():
-                avg_time = np.mean(values) if values else 0
-                print(f"  - Avg {key.capitalize():<12}: {avg_time:.6f} s")
-            print(f"  - Avg Total Batch Time: {np.mean([sum(times) for times in zip(*time_profile.values())]):.6f} s")
-            print(f"  - Total Epoch Time:     {time.time() - t_epoch_start:.2f} s")
-            print("-" * 40)
-
 
             # --- 验证阶段 ---
             val_metrics = self.evaluate('val')
@@ -293,9 +361,11 @@ class Trainer:
             print(f"Epoch {epoch:03d} | Avg Train Loss: {avg_train_loss:.4f} | Composite Val Score: {current_composite_score:.4f}")
 
             # 2. 基于综合分数进行模型选择
-            if current_composite_score > best_composite_score:
-                best_composite_score = current_composite_score
-                patience_counter = 0
+            is_best = False
+            if current_composite_score > self.best_val_score:
+                self.best_val_score = current_composite_score
+                self.patience_counter = 0
+                is_best = True
                 print("New best composite validation score! Evaluating on test set...")
                 best_test_metrics = self.evaluate('test')
 
@@ -310,9 +380,12 @@ class Trainer:
                         metrics_str = ', '.join([f'{k}: {v:.4f}' for k, v in metrics.items()])
                         print(f"    - Task [{task}]: {metrics_str}")
             else:
-                patience_counter += 1
+                self.patience_counter += 1
+
+            # --- 新增：在每个 epoch 结束后保存检查点 ---
+            self._save_checkpoint(epoch, is_best=is_best)
             
-            if patience_counter >= self.args.patience:
+            if self.patience_counter >= self.args.patience:
                 print(f"Early stopping at epoch {epoch}.")
                 break
         

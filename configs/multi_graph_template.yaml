@@ -2,13 +2,14 @@
 #   Base Configuration for Multi-Graph Datasets
 # ======================================================================
 
-# e.g. bm/dgl/bm_mn_dgl, bm/dgl/bm_ms_dgl, bm/dgl/bm_mn_mt_dgl, mnist_processed/mnist0_strict, mnist_processed/mnist1_strict, TGroup
-dataset: 'bm/dgl/bm_mn_dgl'
+# e.g. bm/dgl/bm_mn_dgl, bm/dgl/bm_ms_dgl, bm/dgl/bm_mn_mt_dgl, mnist_processed/mnist0_strict, mnist_processed/mnist1_strict, TGroup, mutag/dgl/mutag
+dataset: 'mutag/dgl/mutag'
 
 # --- 路径与设备 ---
 data_dir: ./data
 results_dir: ./results
 save_dir: ./pretrained
+checkpoint_dir: './checkpoints'
 device: cuda
 
 # --- 训练控制 ---
@@ -16,8 +17,11 @@ seed: 42
 num_trials: 5
 epochs: 200
 patience: 30
-batch_size: 32
-metric: AUPRC
+batch_size: 16
+composite_score_weights:
+  AUPRC: 2.0   # 对于 Reddit，我们将 AUPRC 的权重设为 0
+  AUROC: 0.5   # 将 AUROC 的权重设为 1.0，使其成为主导指标
+  MacroF1: 0.0 # MacroF1 仍然不参与
 
 # --- 模型与优化器 ---
 lr: 5e-4
@@ -32,7 +36,7 @@ final_mlp_layers: 2
 gna_proj_dim: 128
 
 # --- 预训练模型架构 ---
-pretrain_path: './pretrained/mnist_processed_mnist0_strict_enc_gcn2_dec_gcn1_e100_h128_loss_sce.pt'
+pretrain_path: './pretrained/mutag_dgl_mutag_enc_gcn2_dec_gcn1_e100_h128_loss_mse.pt'
 pretrain_encoder_type: 'gcn'
 pretrain_decoder_type: 'gcn'
 pretrain_hid_dim: 128
@@ -62,7 +66,7 @@ w_classification: 1.0
 
 # --- 数据增强控制 ---
 # 核心开关: 控制是否在微调阶段对多图进行在线增强
-use_downstream_multi_graph_aug: True # <--- 建议设为 True 来启用
+use_downstream_multi_graph_aug: true # <--- 建议设为 True 来启用
 
 # 新增: 多图在线增强的具体参数 (仅在 use_downstream_multi_graph_aug 为 True 时生效)
 aug_drop_node_rate: 0.2
